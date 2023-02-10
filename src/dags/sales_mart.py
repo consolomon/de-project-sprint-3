@@ -5,24 +5,26 @@ import pandas as pd
 
 from datetime import datetime, date, timedelta
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator, BranchPythonOperator
+from airflow.operators.python_operator import PythonOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.hooks.http_hook import HttpHook
+import logging
 
 http_conn_id = HttpHook.get_connection('http_conn_id')
 api_key = http_conn_id.extra_dejson.get('api_key')
 base_url = http_conn_id.host
+task_logger = logging.getLogger('airflow.task')
 
-postgres_conn_id = 'postgresql_de'
-nickname = 'jovyan'
-cohort = '10'
+POSTGRES_CONN_ID = 'postgresql_de'
+NICKNAME = 'jovyan'
+COHORT = '10'
 
 business_dt = '{{ ds }}'
-period_name = 'weekly'
-period_id = 'week_of_year'
-end_date = date.today()
-start_date = end_date - timedelta(days=7)
+PERIOD_NAME = 'weekly'
+PERIOD_ID = 'week_of_year'
+END_DATE = date.today()
+START_DATE = end_date - timedelta(days=7)
 
 headers = {
     'X-Nickname': nickname,
@@ -34,17 +36,17 @@ headers = {
 
 
 def generate_report(ti):
-    print('Making request generate_report')
+    task_logger.info('Making request generate_report')
 
     response = requests.post(f'{base_url}/generate_report', headers=headers)
     response.raise_for_status()
     task_id = json.loads(response.content)['task_id']
     ti.xcom_push(key='task_id', value=task_id)
-    print(f'Response is {response.content}')
+    task_logger.info(f'Response is {response.content}')
 
 
 def get_report(ti):
-    print('Making request get_report')
+    task_logger.info('Making request get_report')
     task_id = ti.xcom_pull(key='task_id')
 
     report_id = None
@@ -52,7 +54,7 @@ def get_report(ti):
     for i in range(20):
         response = requests.get(f'{base_url}/get_report?task_id={task_id}', headers=headers)
         response.raise_for_status()
-        print(f'Response is {response.content}')
+        task_logger.info(f'Response is {response.content}')
         status = json.loads(response.content)['status']
         if status == 'SUCCESS':
             report_id = json.loads(response.content)['data']['report_id']
@@ -61,27 +63,29 @@ def get_report(ti):
             time.sleep(20)
 
     if not report_id:
+        task_logger.error('Time for waiting is out. You need to reduce server load or increase waiting time')
         raise TimeoutError()
 
     ti.xcom_push(key='report_id', value=report_id)
-    print(f'Report_id={report_id}')
+    task_logger.info(f'Report_id={report_id}')
 
 
 def get_increment(date, ti):
-    print('Making request get_increment')
+    task_logger.info('Making request get_increment')
     report_id = ti.xcom_pull(key='report_id')
     response = requests.get(
         f'{base_url}/get_increment?report_id={report_id}&date={str(date)}T00:00:00',
         headers=headers)
     response.raise_for_status()
-    print(f'Response is {response.content}')
+    task_logger.info(f'Response is {response.content}')
 
     increment_id = json.loads(response.content)['data']['increment_id']
     if not increment_id:
-        raise ValueError(f'Increment is empty. Most probably due to error in API call.')
-    
+        task_logger.error(f'Increment is empty. Most probably due to error in API call.')
+        raise ValueError()
+
     ti.xcom_push(key='increment_id', value=increment_id)
-    print(f'increment_id={increment_id}')
+    task_logger.info(f'increment_id={increment_id}')
 
 
 def upload_data_to_staging(filename, date, pg_table, pg_schema, ti):
@@ -93,19 +97,18 @@ def upload_data_to_staging(filename, date, pg_table, pg_schema, ti):
     response = requests.get(s3_filename)
     response.raise_for_status()
     open(f"{local_filename}", "wb").write(response.content)
-    print(response.content)
+    task_logger.info(response.content)
 
-    df = pd.read_csv(local_filename)
-    df=df.drop('id', axis=1)
-    df=df.drop_duplicates(subset=['uniq_id'])
+    df = pd.read_csv(local_filename, index_col=0)
+    df = df.drop_duplicates(subset=['uniq_id'])
 
     if 'status' not in df.columns:
         df['status'] = 'shipped'
 
-    postgres_hook = PostgresHook(postgres_conn_id)
+    postgres_hook = PostgresHook(POSTGRES_CONN_ID)
     engine = postgres_hook.get_sqlalchemy_engine()
     row_count = df.to_sql(pg_table, engine, schema=pg_schema, if_exists='append', index=False)
-    print(f'{row_count} rows was inserted')
+    task_logger.info(f'{row_count} rows was inserted')
 
 
 args = {
@@ -113,7 +116,7 @@ args = {
     'email': ['kosyak1998@yandex.ru'],
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': 0
+    'retries': 1
 }
 
 with DAG(
@@ -139,10 +142,10 @@ with DAG(
 
     rollback_user_order_inc = PostgresOperator(
         task_id='rollback_user_order_inc',
-        postgres_conn_id=postgres_conn_id,
-        sql="/sql/staging.user_order_log-rollback.sql",
-        parameters={"date": {business_dt}}       
-    )    
+        postgres_conn_id=POSTGRES_CONN_ID,
+        sql="migrations/staging.user_order_log-rollback.sql",
+        parameters={"date": {business_dt}}
+    )
 
     upload_user_order_inc = PythonOperator(
         task_id='upload_user_order_inc',
@@ -154,35 +157,35 @@ with DAG(
 
     update_d_item_table = PostgresOperator(
         task_id='update_d_item',
-        postgres_conn_id=postgres_conn_id,
-        sql="sql/mart.d_item.sql")
+        postgres_conn_id=POSTGRES_CONN_ID,
+        sql="migrations/mart.d_item.sql")
 
     update_d_customer_table = PostgresOperator(
         task_id='update_d_customer',
-        postgres_conn_id=postgres_conn_id,
-        sql="sql/mart.d_customer.sql")
+        postgres_conn_id=POSTGRES_CONN_ID,
+        sql="migrations/mart.d_customer.sql")
 
     update_d_city_table = PostgresOperator(
         task_id='update_d_city',
-        postgres_conn_id=postgres_conn_id,
-        sql="sql/mart.d_city.sql")
+        postgres_conn_id=POSTGRES_CONN_ID,
+        sql="migrations/mart.d_city.sql")
 
     update_f_sales = PostgresOperator(
         task_id='update_f_sales',
-        postgres_conn_id=postgres_conn_id,
-        sql="sql/mart.f_sales.sql",
+        postgres_conn_id=POSTGRES_CONN_ID,
+        sql="migrations/mart.f_sales.sql",
         parameters={"date": {business_dt}}
     )
 
     update_f_customer_retention = PostgresOperator(
         task_id='update_f_customer_retention',
-        postgres_conn_id=postgres_conn_id,
-        sql="sql/mart.f_customer_retention.sql",
-        params={"period_name": period_name,
-                    "period_id": period_id,
-                    "start_date": start_date,
-                    "end_date": end_date
-        }
+        postgres_conn_id=POSTGRES_CONN_ID,
+        sql="migrations/mart.f_customer_retention.sql",
+        params={"period_name": PERIOD_NAME,
+                "period_id": PERIOD_ID,
+                "start_date": START_DATE,
+                "end_date": END_DATE
+                }
     )
 
     (
